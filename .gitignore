@@ -1,0 +1,20 @@
+# 解包中间产物（bootstrap.py 生成，含 PyInstaller 原始 exe 内容）
+.work/
+
+# 构建输出（体积大，且可由 tools/build.py 重新生成）
+dist/*.exe
+release/*.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/
