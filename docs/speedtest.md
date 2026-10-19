@@ -48,7 +48,7 @@
 | 文件 | 说明 |
 |------|------|
 | `dist/NetMonitor-fixed.exe` | 打好补丁的程序（28,653,304 字节） |
-| `dist/安装测速补丁.ps1` | 一键安装脚本（自动提权 + 自动备份 + SHA256 校验） |
+| `dist/install-speedtest-patch.ps1` | 一键安装脚本（自动提权 + 自动备份 + SHA256 校验） |
 
 ## 技术约束：为什么代码长这样
 
@@ -152,7 +152,7 @@ GET /api/speedtest?start=1 -> phase=running
 
 ## 安装
 
-**双击 `dist/安装测速补丁.ps1`** 即可。脚本会：
+**双击 `dist/install-speedtest-patch.ps1`** 即可。脚本会：
 
 1. 自动请求管理员权限
 2. 关闭正在运行的 NetMonitor

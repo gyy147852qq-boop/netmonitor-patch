@@ -118,7 +118,17 @@ py -3 tools/build.py            # 构建到 dist/，含自检
 py -3 tools/build.py --install  # 构建并安装（自动备份）
 ```
 
-### 3. 自检
+### 3. 安装
+
+```powershell
+# 方式一：构建并直接安装（自动备份）
+py -3 tools/build.py --install
+
+# 方式二：用安装脚本（双击，自动提权 + 备份 + SHA256 校验）
+dist/install-speedtest-patch.ps1
+```
+
+### 4. 自检
 
 ```powershell
 py -3 tools/verify.py    # 校验构建产物
