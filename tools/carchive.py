@@ -97,12 +97,20 @@ class Archive:
         return [(e.name, e.typecode, e.clen, e.ulen) for e in self.entries]
 
     # ------------------------------------------------------------------ #
-    def write(self, out_path, replacements: dict[str, bytes]) -> Path:
-        """把 replacements（键为归一化条目名）打进一个新的单文件 exe。
+    def write(self, out_path, replacements: dict, add: dict | None = None) -> Path:
+        """把 replacements 打进一个新的单文件 exe。
+
+        replacements: {条目名: bytes}，替换已有条目
+        add:          {条目名: bytes}，**新增**条目（键不能与已有条目重名）
 
         除被替换的条目外，其余条目逐字节原样搬运；引导段与 TOC 记录头也保留，
-        只更新 offset / clen / ulen / cflag 四个字段。
+        只更新 offset / clen / ulen / cflag 四个字段。新增条目追加在数据区末尾，
+        TOC 记录按 CArchive 格式现造（elen=18+namelen+1）。
         """
+        add = add or {}
+        clash = sorted(set(add) & {e.key for e in self.entries})
+        if clash:
+            raise ValueError("add 里的条目已存在，请改用 replacements: %s" % ", ".join(clash))
         out = bytearray()
         toc = bytearray()
         changed = []
@@ -123,6 +131,27 @@ class Archive:
             struct.pack_into(ENTRY, rec, 0, e.elen, offset, clen, ulen,
                              cflag, e.typecode.encode())
             toc += rec
+
+        # ---- 新增条目 ---- #
+        # 数据文件（d）不压缩：WinDivert 驱动、DLL 这类二进制原样存放，
+        # 否则 PyInstaller 解包时会拿到压缩流。
+        for name, payload in add.items():
+            if name.endswith((".dll", ".sys", ".pyd")):
+                body, clen, ulen, cflag = payload, len(payload), len(payload), 0
+            else:
+                blob = zlib.compress(payload, 9)
+                body, clen, ulen, cflag = blob, len(blob), len(payload), 1
+            offset = len(out)
+            out += body
+            nb = name.encode("utf-8")
+            elen = 18 + len(nb) + 1
+            rec = bytearray(elen)
+            struct.pack_into(ENTRY, rec, 0, elen, offset, clen, ulen,
+                             cflag, b"d")
+            rec[18:18 + len(nb)] = nb
+            rec[-1] = 0
+            toc += rec
+            changed.append((name, 0, ulen))
 
         toc_off = len(out)
         out += toc

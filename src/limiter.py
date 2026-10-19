@@ -75,11 +75,17 @@ def _config_path() -> str:
     return os.path.join(root, "NetMonitor", "limiter.json")
 
 
+# WinDivert 官方发行包的命名：64 位 DLL 叫 WinDivert.dll，驱动叫 WinDivert64.sys
+# （早期文档写作 WinDivert64.dll，实际 zip 里并不存在这个名字）
+DLL_NAME = "WinDivert.dll"
+SYS_NAME = "WinDivert64.sys"
+
+
 def dll_paths() -> dict:
     d = _res_dir()
     return {"dir": d,
-            "dll": os.path.join(d, "WinDivert64.dll"),
-            "sys": os.path.join(d, "WinDivert64.sys")}
+            "dll": os.path.join(d, DLL_NAME),
+            "sys": os.path.join(d, SYS_NAME)}
 
 
 def _build_filter(scope: str, excluded) -> str:
@@ -221,24 +227,34 @@ class _Limiter:
             win = ctypes.WinDLL(paths["dll"])
         except Exception as exc:
             self.st["available"] = False
-            self.st["error"] = "加载 WinDivert64.dll 失败：%s" % (exc,)
+            self.st["error"] = "加载 %s 失败：%s" % (DLL_NAME, exc)
             return False
 
         H = wintypes.HANDLE
-        ULEN = ctypes.c_size_t
-        win.WinDivertOpen.argtypes = [ctypes.c_char_p, ctypes.c_short,
-                                      ctypes.c_short, ctypes.c_uint64]
+        ULEN = ctypes.c_uint        # WinDivertRecv/Send 的 UINT*，不是 size_t
+
+        # WinDivertOpen(filter, int layer, INT16 priority, UINT64 flags)
+        # layer 是 int（4 字节），priority 才是 int16（2 字节）。
+        # x64 上把 int 绑成 c_short 会让高位寄存器残留垃圾，layer 值错乱。
+        win.WinDivertOpen.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                      ctypes.c_int16, ctypes.c_uint64]
         win.WinDivertOpen.restype = H
         win.WinDivertClose.argtypes = [H]
         win.WinDivertClose.restype = wintypes.BOOL
         win.WinDivertShutdown.argtypes = [H]
         win.WinDivertShutdown.restype = wintypes.BOOL
+        # windivert.h: BOOL WinDivertRecv(HANDLE, PVOID pPacket, UINT packetLen,
+        #                                 UINT *pRecvLen, PWINDIVERT_ADDRESS pAddr);
+        # 只有 5 个参数；多写一个会让 ctypes 按 6 参调用，栈上错位，
+        # 表现为开了限速就连不上网。
         win.WinDivertRecv.argtypes = [H, ctypes.c_void_p, ctypes.c_uint,
-                                      ctypes.POINTER(ULEN),
-                                      ctypes.POINTER(ctypes.c_uint), ctypes.c_void_p]
+                                       ctypes.POINTER(ULEN),
+                                       ctypes.c_void_p]
         win.WinDivertRecv.restype = wintypes.BOOL
+        # windivert.h: BOOL WinDivertSend(HANDLE, PCVOID pPacket, UINT packetLen,
+        #                                 UINT *pSendLen, PCWINDIVERT_ADDRESS pAddr);
         win.WinDivertSend.argtypes = [H, ctypes.c_void_p, ULEN, ctypes.c_void_p,
-                                      ctypes.POINTER(ctypes.c_uint)]
+                                       ctypes.POINTER(ULEN)]
         win.WinDivertSend.restype = wintypes.BOOL
         win.WinDivertSetParam.argtypes = [H, ctypes.c_int, ctypes.c_uint64]
         win.WinDivertSetParam.restype = wintypes.BOOL
@@ -271,14 +287,21 @@ class _Limiter:
                                     % (ctypes.get_last_error() or 0))
                 return False
             self._handle = h
+            # 队列要足够大：包进了 WinDivert 队列但 Python 来不及收，
+            # 队列满时 WinDivert 会**直接丢包**，表现为限速一开网络就卡死。
+            # QUEUE_TIME 放大（毫秒），给收包循环留出处理时间。
             try:
-                self._win.WinDivertSetParam(h, WINDIVERT_PARAM_QUEUE_LENGTH, 2048)
-                self._win.WinDivertSetParam(h, WINDIVERT_PARAM_QUEUE_TIME, 50)
+                self._win.WinDivertSetParam(h, WINDIVERT_PARAM_QUEUE_LENGTH, 32768)
+                self._win.WinDivertSetParam(h, WINDIVERT_PARAM_QUEUE_TIME, 2000)
             except Exception:
                 pass
             self._buf = ctypes.create_string_buffer(_MAX_PKT)
-            self._mv = memoryview(self._buf)
-            self._plen = ctypes.c_size_t(0)
+            # 显式 cast 成 "B"（无符号字节）：
+            # create_string_buffer 的 format 是 "c"，Python 3.13 起
+            # 对 "c" 格式的 memoryview 切片/索引抛 NotImplementedError。
+            self._mv = memoryview(self._buf).cast("B")
+            # 与 WinDivertRecv 的 UINT *pPacketLen 对应（4 字节）
+            self._plen = ctypes.c_uint(0)
             self._rflags = ctypes.c_uint(0)
             self._addr = ctypes.create_string_buffer(WINDIVERT_ADDRESS_SIZE)
             self._slen = ctypes.c_uint(0)
@@ -292,19 +315,27 @@ class _Limiter:
             return True
 
     def _close(self) -> None:
+        """关闭句柄。
+
+        关键：必须 WinDivertClose（不是只 Shutdown）。Shutdown 只是让 recv 返回，
+        队列里剩余的包会被**全部丢弃**；只有 Close 才会把它们交还内核，
+        否则关闭限速后网络仍然不通。
+        """
         with self.lock:
             h = self._handle
             self._handle = None
             self.st["handle_open"] = False
         if h is not None:
-            try:
-                self._win.WinDivertShutdown(h)
-            except Exception:
-                pass
+            # Close 本身就会让阻塞中的 recv 返回，不需要先 Shutdown。
+            # 先 Shutdown 反而会丢掉队列里待处理的包，造成关闭后网络假死。
             try:
                 self._win.WinDivertClose(h)
             except Exception:
-                pass
+                try:
+                    self._win.WinDivertShutdown(h)
+                    self._win.WinDivertClose(h)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ #
     # 端口 -> PID -> 进程名
@@ -354,10 +385,15 @@ class _Limiter:
     # 收包 + 令牌桶
     # ------------------------------------------------------------------ #
     def _recv_loop(self) -> None:
-        try:
-            win = self._win
-        except Exception:
-            return
+        st = self.st
+        win = self._win
+        if win is None:
+            # 还没加载 DLL：等 _open() 去加载，不要在这里返回，
+            # 否则线程直接退出，apply() 之后再也不会有收包线程。
+            win = self._load_dll() and self._win
+            if win is None:
+                self._stop.wait(2.0)
+                return
         st = self.st
         while not self._stop.is_set():
             if not self._active():
@@ -369,8 +405,9 @@ class _Limiter:
                 continue
 
             h = self._handle
-            bufp, plp, rfp, ap, slp = (self._bufp, self._plp, self._rfp,
-                                      self._ap, self._slp)
+            # rfp 已不需要：WinDivertRecv 的第 5 参是 pAddr 而不是 flags
+            bufp, plp, ap, slp = (self._bufp, self._plp,
+                                  self._ap, self._slp)
             mv = self._mv
             plen = self._plen
             recv = win.WinDivertRecv
@@ -379,7 +416,7 @@ class _Limiter:
 
             while not self._stop.is_set():
                 try:
-                    ok = recv(h, bufp, _MAX_PKT, plp, rfp, ap)
+                    ok = recv(h, bufp, _MAX_PKT, plp, ap)
                 except Exception:
                     ok = False
                 if not ok:
@@ -408,6 +445,17 @@ class _Limiter:
                 gb = self._global_bucket
                 grate = gb.rate
                 rules = self.rules
+
+                # ---- 永远放行的包 ----
+                # TCP flags 在 IP 头之后第 13 字节：SYN/FIN/RST 是握手与收尾，
+                # 丢了会导致连接根本建立不起来（实测：限速一开就连不上网）。
+                # ACK-only 的纯确认包通常很小，也一并放行，避免拖慢交互。
+                flags = pkt[ihl + 13]
+                if flags & 0x02 or flags & 0x10 or n < 64:
+                    st["passed_pkts"] += 1
+                    st["passed_bytes"] += n
+                    self._send(h, bufp, n, ap, slp)
+                    continue
 
                 if not rules:
                     # 只按全局限速：不需要知道是谁
@@ -457,8 +505,14 @@ class _Limiter:
                 self._stop.wait(0.5)
 
     def _send(self, h, bufp, n, ap, slp) -> None:
+        """把包交还内核。
+
+        句柄已被换掉/关闭时**不能直接丢包** —— 那等于把用户的流量吞了，
+        表现为开启过限速之后网络一直不通。WinDivertClose 之后 send 会失败，
+        这时只能依赖 Close 自己把残留包交还内核（见 _close 的注释）。
+        """
         if self._handle is not h:
-            return                      # 正在换句柄/关闭，直接丢，避免把 NULL 传进去
+            return
         try:
             self._win.WinDivertSend(h, bufp, n, ap, slp)
         except Exception:

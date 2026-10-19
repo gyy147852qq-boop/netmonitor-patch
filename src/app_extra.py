@@ -106,6 +106,25 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             self._send(500, json.dumps({"error": str(e)}))
 
+    def _speedtest(self, q):
+        """一键测速：把命令塞进线程局部，再调 fetch_public_ip()。"""
+        g = globals()
+        tls = g.get("_SPD_TLS")
+        if tls is None:
+            import threading
+            tls = threading.local()
+            g["_SPD_TLS"] = tls
+        if "cancel" in q:
+            tls.cmd = "cancel"
+        elif "start" in q:
+            tls.cmd = "start"
+        else:
+            tls.cmd = "status"
+        try:
+            self._send(200, json.dumps(fetch_public_ip()))
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
+
     def _patch_from_query(self, q):
         """querystring -> patch（手工调试 / 应急用）。"""
 
@@ -165,6 +184,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/limiter/off":
             self._limiter_apply({"enabled": False, "global": 0, "rules": {}})
             return
+        # 一键测速：POST 形式（与 GET 等价，querystring 优先）
+        if path == "/api/speedtest":
+            q = parse_qs(urlparse(self.path).query)
+            self._speedtest(q)
+            return
         self._send(404, json.dumps({"error": "not found"}))
 
     def do_GET(self):
@@ -180,6 +204,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/limiter/off":
             self._limiter_apply({"enabled": False, "global": 0, "rules": {}})
+            return
+
+        # ---------------------- 一键测速 ---------------------- #
+        # 引擎在 fetch_public_ip 里（app_speed.py 替换后的版本），
+        # 命令通过线程局部 _SPD_TLS 传递，避免并发请求串味。
+        if path == "/api/speedtest":
+            self._speedtest(parse_qs(urlparse(self.path).query))
             return
 
         if path == "/api/stats":

@@ -39,6 +39,7 @@ sys.path.insert(0, str(paths.SRC))     # ui / ui_axis 与 app 同为顶层模块
 import ui as ui_mod  # noqa: E402
 import ui_axis as axis_mod  # noqa: E402
 import ui_speed as speed_ui_mod  # noqa: E402
+import ui_limiter as limiter_ui_mod  # noqa: E402
 from carchive import Archive  # noqa: E402
 
 DIST = paths.ROOT / "dist"
@@ -115,6 +116,11 @@ def build(base_exe: Path, out_exe: Path):
     patched, report = splice(patched, compile(src, "app.py", "exec"))
     report_all += report
 
+    # 3) 下行限速（_shutdown / Handler / main 三个都换）
+    src = (paths.SRC / "app_extra.py").read_text(encoding="utf-8")
+    patched, report = splice(patched, compile(src, "app.py", "exec"))
+    report_all += report
+
     if not report_all:
         raise SystemExit("没有任何函数被替换，中止")
     payloads = {"app": marshal.dumps(patched)}
@@ -130,6 +136,8 @@ def build(base_exe: Path, out_exe: Path):
         html = axis_mod.patch_detail_axis(html)
     # 一键测速前端（幂等）
     html = speed_ui_mod.patch_speed(html)
+    # 下行限速前端（幂等）
+    html = limiter_ui_mod.patch_limiter(html)
     if html != raw_html:
         payloads["web/index.html"] = html.encode("utf-8")
         print("index.html: %d -> %d bytes"
@@ -137,27 +145,62 @@ def build(base_exe: Path, out_exe: Path):
     else:
         print("index.html: 基座已含全部前端补丁，跳过")
 
+    # --- 限速引擎：把 nb_limiter 追加进 PYZ ---
+    # PYZ 的 TOC 是整体 marshal，不能就地插入，所以整块重打（见 pyzpatch.py）
+    from pyzpatch import build_pyz, list_modules
+    limiter_src = (paths.SRC / "limiter.py").read_text(encoding="utf-8")
+    old_pyz = archive.read("PYZ.pyz")
+    n_before = len(list_modules(old_pyz))
+    new_pyz = build_pyz(old_pyz, {"nb_limiter": limiter_src})
+    n_after = len(list_modules(new_pyz))
+    if new_pyz != old_pyz:
+        payloads["PYZ.pyz"] = new_pyz
+        print("PYZ       : %d -> %d modules (+nb_limiter), %d -> %d bytes"
+              % (n_before, n_after, len(old_pyz), len(new_pyz)))
+    else:
+        print("PYZ       : 已含 nb_limiter，跳过")
+
+    # --- WinDivert 驱动文件：作为数据条目新增进 CArchive ---
+    add = {}
+    vend = paths.VENDOR
+    for fname in ("WinDivert.dll", "WinDivert64.sys"):
+        f = vend / fname
+        if f.exists():
+            add[fname] = f.read_bytes()
+        else:
+            print("WARN      : 缺少 %s，限速功能将不可用（跑 tools/fetch_windivert.py）" % fname)
+    if add:
+        print("vendor    : + %s" % ", ".join("%s (%d bytes)" % (k, len(v)) for k, v in add.items()))
+
     out_exe.parent.mkdir(parents=True, exist_ok=True)
-    written, changed = archive.write(out_exe, payloads)
+    written, changed = archive.write(out_exe, payloads, add=add)
     print("built     : %s (%d bytes)" % (written, written.stat().st_size))
     return written, changed
 
 
 # --------------------------------------------------------------------------- #
-def selfcheck(src_exe: Path, out_exe: Path, allowed={"app", "web/index.html"},
-              expect=("app", "web/index.html")):
+def selfcheck(src_exe: Path, out_exe: Path,
+               allowed={"app", "web/index.html", "PYZ.pyz",
+                        "WinDivert.dll", "WinDivert64.sys"},
+               expect=("app", "web/index.html")):
     import hashlib
 
     a, b = Archive(src_exe), Archive(out_exe)
     print("\n--- self check ---")
-    assert [e.name for e in a.entries] == [e.name for e in b.entries], "条目顺序变了"
-    print("entries   : %d -> %d，顺序一致" % (len(a.entries), len(b.entries)))
+    ka = [e.key for e in a.entries]
+    kb = [e.key for e in b.entries]
+    assert ka == kb[:len(ka)], "原有条目顺序变了"
+    added = [k for k in kb if k not in set(ka)]
+    print("entries   : %d -> %d（新增 %s）"
+          % (len(a.entries), len(b.entries), ", ".join(added) or "无"))
 
     changed = []
-    for x, y in zip(a.entries, b.entries):
-        rx, ry = a.read(x.name), b.read(y.name)
+    for x in a.entries:
+        rx, ry = a.read(x.name), b.read(x.name)
         if hashlib.sha256(rx).digest() != hashlib.sha256(ry).digest():
             changed.append((x.key, len(rx), len(ry)))
+    for k in added:
+        changed.append((k, 0, len(b.read(k))))
     print("changed   :", changed)
 
     extra = {c[0] for c in changed} - allowed
@@ -166,11 +209,21 @@ def selfcheck(src_exe: Path, out_exe: Path, allowed={"app", "web/index.html"},
         assert name in {c[0] for c in changed}, "%s 没有变化" % name
     assert a.data[:a.start] == b.data[:b.start], "引导段被改动"
     print("bootloader: 一致")
-    try:
-        assert a.read("PYZ.pyz") == b.read("PYZ.pyz"), "PYZ 被改动"
-        print("PYZ       : 一致（%d bytes）" % len(a.read("PYZ.pyz")))
-    except KeyError:
-        print("PYZ       : 归档里没有该条目，跳过")
+
+    # PYZ 只允许新增模块，原有模块必须逐字节一致
+    from pyzpatch import parse_pyz
+    za = a.read("PYZ.pyz")
+    zb = b.read("PYZ.pyz")
+    # toc_off 在追加模块后必然后移，只校验 magic 与 python magic
+    assert za[:8] == zb[:8], "PYZ 头部（magic / python magic）被改动"
+    pa = dict((t[0], t[1]) for t in parse_pyz(za)[1])
+    pb = dict((t[0], t[1]) for t in parse_pyz(zb)[1])
+    for n, (typ, pos, length) in pa.items():
+        q = pb[n]
+        assert za[pos:pos + length] == zb[q[1]:q[1] + length], \
+            "PYZ 模块 %s 被改动" % n
+    print("PYZ       : %d -> %d modules，原有 %d 个逐字节一致"
+          % (len(pa), len(pb), len(pa)))
 
 
 def install(out_exe: Path, target: Path):

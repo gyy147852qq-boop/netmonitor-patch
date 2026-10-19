@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 TOOLS = ROOT / "tools"
 RELEASE = ROOT / "release"
+VENDOR = ROOT / "vendor"    # WinDivert 驱动文件（fetch_windivert.py 下载）
 DOCS = ROOT / "docs"
 
 # 所有中间产物都在这里，.gitignore 已排除
