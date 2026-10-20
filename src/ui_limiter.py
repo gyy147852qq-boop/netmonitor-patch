@@ -85,10 +85,11 @@ function limRender(d){
   if(!box) return;
   if(d.error){ box.innerHTML='<div class="empty">加载失败：'+esc(d.error)+'</div>'; return; }
 
-  const st=d.st||{};
-  const cfg=d.cfg||{};
+  // state() 返回的是扁平 JSON：enabled/scope/global/rules/available/error 都在顶层
+  const st=d;
+  const cfg=d;
   const on=!!cfg.enabled;
-  const av=st.available!==false;
+  const av=d.available!==false;
   let h="";
 
   // 状态条
@@ -219,21 +220,31 @@ async function limRefresh(){
   limStopPoll();
   const d=await limFetch("");
   limRender(d);
-  if(d.cfg&&d.cfg.enabled&&d.st&&d.st.available!==false){
+  // 扁平结构：enabled / available 都在顶层
+  if(d.enabled&&d.available!==false&&!d.error){
     _limTimer=setInterval(async()=>{
       const s=await limFetch("");
-      if(s.st&&!s.error){
+      if(!s.error&&s.available!==false){
         const el=document.getElementById("limRateNow");
-        if(el) el.textContent=limFmtBps(s.st.rate);
+        if(el) el.textContent=limFmtBps(s.rate);
       }
     },1000);
   }
 }"""
 
 
+# 补丁版本：改了 JS/CSS 内容就 +1，否则 html 里已注入的旧版会被幂等检查跳过
+LIMITER_PATCH_VER = 3
+
+
 def patch_limiter(html: str) -> str:
-    """把限速按钮 + 面板 + JS 注入 index.html。幂等。"""
-    if "showLimiter" in html and 'id="limModal"' in html:
+    """把限速按钮 + 面板 + JS 注入 index.html。
+
+    幂等判断用版本指纹（<!--limiter-vN-->），
+    而不是“启动器名称存在”——否则改了补丁内容也不会重新注入。
+    """
+    marker = "<!--limiter-v%d-->" % LIMITER_PATCH_VER
+    if marker in html:
         return html
 
     # 1) 样式
@@ -259,4 +270,5 @@ def patch_limiter(html: str) -> str:
     tail = "initCharts();\npoll();\nsetInterval(poll,1000);"
     assert tail in html, "script tail anchor not found"
     html = html.replace(tail, LIMITER_JS + "\n" + tail, 1)
+    html = html.replace("</head>", "  " + marker + "\n</head>", 1)
     return html

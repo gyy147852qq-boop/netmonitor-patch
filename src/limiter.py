@@ -281,10 +281,22 @@ class _Limiter:
             except Exception as exc:
                 self.st["error"] = "WinDivertOpen 失败：%s（需要管理员权限）" % (exc,)
                 return False
-            if not h:
-                self.st["error"] = ("WinDivertOpen 失败（错误码 %d），"
-                                    "请确认以管理员身份运行。"
-                                    % (ctypes.get_last_error() or 0))
+            # WinDivert 2.x 的失败语义：返回 NULL **或** INVALID_HANDLE_VALUE(-1)。
+            # 官方采用「惰性初始化」—— 即便权限不足也先返回 -1，
+            # 真正的错误要等第一次 WinDivertRecv 才暴露。
+            # 所以 `if not h` 这种判断对 -1 会失效（-1 是非零真值）。
+            INVALID = 0xFFFFFFFFFFFFFFFF
+            if h == 0 or h == INVALID:
+                err = ctypes.get_last_error()
+                # WinDivert 2.x 在权限不足时返回 INVALID_HANDLE_VALUE(-1)
+                # 且**不设置** last error（实测 err=0）。此时没有任何错误码可读，
+                # 只能靠"非管理员"这个已知条件给出可操作的提示。
+                if h == INVALID and not err:
+                    self.st["error"] = ("需要管理员权限：WinDivert 驱动无法打开。")
+                else:
+                    self.st["error"] = ("WinDivertOpen 失败（错误码 %d）。"
+                                        "请尝试以管理员身份运行本程序。"
+                                        % (err or 0))
                 return False
             self._handle = h
             # 队列要足够大：包进了 WinDivert 队列但 Python 来不及收，
@@ -386,20 +398,23 @@ class _Limiter:
     # ------------------------------------------------------------------ #
     def _recv_loop(self) -> None:
         st = self.st
-        win = self._win
-        if win is None:
-            # 还没加载 DLL：等 _open() 去加载，不要在这里返回，
-            # 否则线程直接退出，apply() 之后再也不会有收包线程。
-            win = self._load_dll() and self._win
-            if win is None:
-                self._stop.wait(2.0)
-                return
-        st = self.st
+        # 这个线程从 start() 起必须常驻：用户随时可能通过 /api/limiter 打开限速。
+        # 早期版本在 DLL 未加载时直接 return，导致线程永久退出，
+        # 之后 apply(enabled=True) 再也没有人打开句柄，限速毫无效果。
         while not self._stop.is_set():
+            # 没有任何限速规则时保持零开销：不加载驱动、不收包
             if not self._active():
                 self._close()
                 self._stop.wait(1.0)
                 continue
+            # 需要限速了：确保 DLL 已加载（可能还没加载过）
+            win = self._win
+            if win is None:
+                self._load_dll()
+                win = self._win
+                if win is None:
+                    self._stop.wait(2.0)
+                    continue
             if not self._open():
                 self._stop.wait(2.0)
                 continue

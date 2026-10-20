@@ -160,17 +160,25 @@ def build(base_exe: Path, out_exe: Path):
     else:
         print("PYZ       : 已含 nb_limiter，跳过")
 
-    # --- WinDivert 驱动文件：作为数据条目新增进 CArchive ---
+    # --- WinDivert 驱动文件：已存在则替换，否则新增 ---
+    # 基座可能已经打过补丁（122 entries 里已有 WinDivert），此时要替换而不是新增。
     add = {}
+    existing_keys = {e.key for e in archive.entries}
     vend = paths.VENDOR
     for fname in ("WinDivert.dll", "WinDivert64.sys"):
         f = vend / fname
         if f.exists():
-            add[fname] = f.read_bytes()
+            if fname in existing_keys:
+                payloads[fname] = f.read_bytes()      # 已存在 -> 替换
+            else:
+                add[fname] = f.read_bytes()           # 不存在 -> 新增
         else:
             print("WARN      : 缺少 %s，限速功能将不可用（跑 tools/fetch_windivert.py）" % fname)
-    if add:
-        print("vendor    : + %s" % ", ".join("%s (%d bytes)" % (k, len(v)) for k, v in add.items()))
+    if add or any(k in payloads for k in ("WinDivert.dll", "WinDivert64.sys")):
+        print("vendor    : WinDivert.dll (%d), WinDivert64.sys (%d) %s"
+              % (len(payloads.get("WinDivert.dll", add.get("WinDivert.dll", b""))),
+                 len(payloads.get("WinDivert64.sys", add.get("WinDivert64.sys", b""))),
+                 "(新增)" if add else "(替换)"))
 
     out_exe.parent.mkdir(parents=True, exist_ok=True)
     written, changed = archive.write(out_exe, payloads, add=add)
